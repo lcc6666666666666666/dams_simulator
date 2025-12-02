@@ -207,3 +207,139 @@ class DAMSScheduler(BaseScheduler):
       if allocations:
         return allocations
     return []
+
+
+class DAMSConservativeScheduler(DAMSScheduler):
+  """DAMS-C: 从接收端视角力求子流“同时完成”。
+
+  思路：找到一个最早的完成时间 T（不超过截止时间），使得各路径在 T 前的可用容量
+  之和足以覆盖当前块，然后按各路径在 T 前的可用容量比例拆分，力求在接收端同时收齐。
+  """
+
+  name = "DAMS-C"
+
+  def select_transmissions(self, ready_blocks, all_paths, idle_paths, current_time):
+    if not idle_paths:
+      return []
+    ready = self._eligible_blocks(ready_blocks, current_time)
+    if not ready:
+      return []
+    prioritized = self._sorted_by_priority(ready)
+
+    for block in prioritized:
+      remaining_time = block.deadline - current_time
+      if remaining_time <= 0:
+        continue
+      finish_target = self._earliest_feasible_finish(block, idle_paths, current_time)
+      if finish_target is None:
+        continue
+      caps = self._capacity_until_finish(idle_paths, current_time, finish_target, block.deadline)
+      total_cap = sum(caps.values())
+      if total_cap <= 0 or block.remaining_size > total_cap:
+        continue
+
+      size_needed = block.remaining_size
+      ordered_paths = sorted(idle_paths, key=lambda p: (p.latency_s, -p.bandwidth_at(current_time)))
+      proportions: List[int] = []
+      for path in ordered_paths:
+        cap = caps.get(path.path_id, 0.0)
+        portion = int(size_needed * (cap / total_cap)) if cap > 0 else 0
+        proportions.append(portion)
+      if sum(proportions) == 0 and proportions:
+        proportions[0] = size_needed
+      else:
+        diff = size_needed - sum(proportions)
+        if proportions and diff != 0:
+          proportions[0] += diff
+      allocations: List[TransmissionRequest] = []
+      for path, portion in zip(ordered_paths, proportions):
+        if portion <= 0:
+          continue
+        allocations.append(TransmissionRequest(block=block, path=path, size=portion))
+      if allocations:
+        return allocations
+    return []
+
+  def _earliest_feasible_finish(
+      self, block: FrameBlock, paths: Sequence[PathState], current_time: float
+  ) -> float | None:
+    """二分搜索最早可行的完成时间（不超过截止），使容量之和覆盖块大小。"""
+    start_min = min(max(current_time, p.available_time) + p.latency_s for p in paths)
+    low = start_min
+    high = block.deadline
+    if self._capacity_sum(paths, current_time, high) < block.remaining_size:
+      return None
+    for _ in range(30):
+      mid = (low + high) / 2
+      if self._capacity_sum(paths, current_time, mid) >= block.remaining_size:
+        high = mid
+      else:
+        low = mid
+    return high
+
+  def _capacity_sum(self, paths: Sequence[PathState], current_time: float, finish: float) -> float:
+    caps = self._capacity_until_finish(paths, current_time, finish, finish)
+    return sum(caps.values())
+
+  def _capacity_until_finish(
+      self, paths: Sequence[PathState], current_time: float, finish: float, deadline: float
+  ) -> dict[str, float]:
+    caps: dict[str, float] = {}
+    target = min(finish, deadline)
+    for path in paths:
+      start_time = max(current_time, path.available_time)
+      time_budget = target - start_time - path.latency_s
+      if time_budget <= 0:
+        caps[path.path_id] = 0.0
+        continue
+      bandwidth = path.bandwidth_at(start_time)
+      caps[path.path_id] = max(0.0, bandwidth * time_budget)
+    return caps
+
+
+class DEMSScheduler(BaseScheduler):
+  """DEMS: 关注单个块完成时间的拆分策略。"""
+
+  name = "DEMS"
+
+  def select_transmissions(self, ready_blocks, all_paths, idle_paths, current_time):
+    ready = self._eligible_blocks(ready_blocks, current_time)
+    if not ready or not idle_paths:
+      return []
+    # 选优先级高、deadline 早的块（单块优化）
+    block = self._sorted_by_priority(ready)[0]
+    caps: dict[str, float] = {}
+    for path in idle_paths:
+      start_time = max(current_time, path.available_time)
+      time_budget = block.deadline - start_time - path.latency_s
+      if time_budget <= 0:
+        caps[path.path_id] = 0.0
+        continue
+      bandwidth = path.bandwidth_at(start_time)
+      caps[path.path_id] = max(0.0, bandwidth * time_budget)
+    total_cap = sum(caps.values())
+    if total_cap <= 0:
+      return []
+    if block.remaining_size > total_cap:
+      return []
+    ordered_paths = sorted(idle_paths, key=lambda p: (p.latency_s, -p.bandwidth_at(current_time)))
+    size_needed = block.remaining_size
+    proportions: List[int] = []
+    for path in ordered_paths:
+      cap = caps[path.path_id]
+      if cap <= 0:
+        proportions.append(0)
+      else:
+        proportions.append(int(size_needed * (cap / total_cap)))
+    if sum(proportions) == 0 and proportions:
+      proportions[0] = size_needed
+    else:
+      diff = size_needed - sum(proportions)
+      if proportions and diff != 0:
+        proportions[0] += diff
+    allocations: List[TransmissionRequest] = []
+    for path, portion in zip(ordered_paths, proportions):
+      if portion <= 0:
+        continue
+      allocations.append(TransmissionRequest(block=block, path=path, size=portion))
+    return allocations

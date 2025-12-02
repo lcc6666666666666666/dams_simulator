@@ -40,3 +40,32 @@ def load_bandwidth_trace_from_csv(path: str, scale: float = 1.0) -> BandwidthTra
       bandwidths.append(bw_mbps * 1_000_000 / 8.0)
 
   return BandwidthTrace(times=times, bandwidth_Bps=bandwidths)
+
+
+def constant_bandwidth_trace(bw_mbps: float) -> BandwidthTrace:
+  """Create a degenerate trace representing constant bandwidth."""
+  return BandwidthTrace(times=[0.0], bandwidth_Bps=[bw_mbps * 1_000_000 / 8.0])
+
+
+def periodic_bandwidth_trace(
+    high_mbps: float,
+    low_mbps: float,
+    period_s: float = 2.0,
+    cycles: int = 10,
+    start_high: bool = True,
+) -> BandwidthTrace:
+  """Generate a simple square-wave bandwidth trace."""
+  times: List[float] = []
+  values: List[float] = []
+  current_time = 0.0
+  current_high = start_high
+  for _ in range(cycles):
+    times.append(current_time)
+    values.append((high_mbps if current_high else low_mbps) * 1_000_000 / 8.0)
+    current_time += period_s / 2.0
+    current_high = not current_high
+    times.append(current_time)
+    values.append((high_mbps if current_high else low_mbps) * 1_000_000 / 8.0)
+    current_time += period_s / 2.0
+    current_high = not current_high
+  return BandwidthTrace(times=times, bandwidth_Bps=values)
