@@ -164,50 +164,12 @@ class DAMSScheduler(BaseScheduler):
     prioritized = self._sorted_by_priority(ready)
 
     for block in prioritized:
-      remaining_time = block.deadline - current_time
-      if remaining_time <= 0:
+      if block.deadline <= current_time:
         continue
-      bw_info = []
-      for path in idle_paths:
-        start_time = max(current_time, path.available_time)
-        bw = path.bandwidth_at(start_time)
-        if bw <= 0:
-          continue
-        bw_info.append((path, start_time, bw))
-      if not bw_info:
-        continue
-      bw_info = self._rebalance_to_meet_deadline(bw_info, block, current_time)
-      if not bw_info:
-        self._cancel_victim(prioritized, block)
-        continue
-
-      total_bw = sum(bw for _, _, bw in bw_info)
-      if total_bw <= 0:
-        continue
-
-      selected_paths = [p for (p, _, _) in bw_info]
-      bw_map = {p.path_id: bw for (p, _, bw) in bw_info}
-      ordered_paths = sorted(selected_paths, key=lambda p: (p.latency_s, -bw_map[p.path_id]))
-      size_needed = block.remaining_size
-      proportions: List[int] = []
-      for path in ordered_paths:
-        bw = bw_map.get(path.path_id, 0.0)
-        portion = int(size_needed * (bw / total_bw)) if bw > 0 else 0
-        proportions.append(portion)
-      if sum(proportions) == 0 and proportions:
-        proportions[0] = size_needed
-      else:
-        diff = size_needed - sum(proportions)
-        if proportions and diff != 0:
-          proportions[0] += diff
-
-      allocations: List[TransmissionRequest] = []
-      for path, portion in zip(ordered_paths, proportions):
-        if portion <= 0:
-          continue
-        allocations.append(TransmissionRequest(block=block, path=path, size=portion))
+      allocations = self._allocate_with_deadline(block, idle_paths, current_time)
       if allocations:
         return allocations
+      self._cancel_victim(prioritized, block)
     return []
 
   @staticmethod
@@ -222,38 +184,61 @@ class DAMSScheduler(BaseScheduler):
     victim = min(candidates, key=self._normalized_profit)
     victim.dropped = True
 
-  def _rebalance_to_meet_deadline(
-      self,
-      bw_info: list[tuple[PathState, float, float]],
-      block: FrameBlock,
-      current_time: float,
-  ) -> list[tuple[PathState, float, float]]:
-    """寻找共同发送窗口 T 使 max_finish<=deadline；不足时再逐步丢掉路径。"""
-    candidates = []
-    for path, start, bw in bw_info:
-      t_max = block.deadline - start - path.latency_s
-      if t_max <= 0 or bw <= 0:
+  def _allocate_with_deadline(
+      self, block: FrameBlock, idle_paths: Sequence[PathState], current_time: float
+  ) -> List[TransmissionRequest] | None:
+    """按带宽比例拆分，尝试找到共同发送时长不超 deadline 的路径子集。"""
+    candidates: list[tuple[PathState, float, float]] = []
+    for path in idle_paths:
+      start_time = max(current_time, path.available_time)
+      bw = path.bandwidth_at(start_time)
+      if bw <= 0:
         continue
-      candidates.append((path, start, bw, t_max))
+      t_max = block.deadline - start_time - path.latency_s
+      if t_max <= 0:
+        continue
+      candidates.append((path, bw, t_max))
     if not candidates:
-      return []
+      return None
 
-    # 迭代：先尝试用所有路径的最小 t_max 窗口；不足再去掉窗口最小的路径重算。
+    # 先看全部路径在各自窗口内的总容量是否足够
+    feasible_cap = sum(bw * t_max for _, bw, t_max in candidates)
+    if feasible_cap < block.remaining_size:
+      return None
+
+    # 迭代：以最小窗口为共用窗口，若无法完成则移除窗口最小的路径后重试
     while candidates:
-      t_common = min(t_max for _, _, _, t_max in candidates)
-      total_bw = sum(bw for _, _, bw, _ in candidates)
+      t_common = min(t_max for _, _, t_max in candidates)
+      total_bw = sum(bw for _, bw, _ in candidates)
       if total_bw <= 0:
-        return []
-      # 以公共窗口内的总能力判定是否可完成
-      if total_bw * t_common >= block.remaining_size:
-        send_duration = block.remaining_size / total_bw
-        finish_times = [start + p.latency_s + send_duration for (p, start, _, _) in candidates]
-        if max(finish_times) <= block.deadline and send_duration <= t_common + 1e-9:
-          return [(p, s, bw) for (p, s, bw, _) in candidates]
-      # 去掉公共窗口最小的路径（它限制了 T）
-      min_t = min(candidates, key=lambda x: x[3])[3]
-      candidates = [c for c in candidates if c[3] > min_t]
-    return []
+        return None
+      send_duration = block.remaining_size / total_bw
+      finish_times = [
+          max(current_time, p.available_time) + p.latency_s + send_duration
+          for (p, _, _) in candidates
+      ]
+      if send_duration <= t_common + 1e-9 and max(finish_times) <= block.deadline:
+        ordered = sorted(candidates, key=lambda x: (x[0].latency_s, -x[1]))
+        proportions: List[int] = []
+        for _, bw, _ in ordered:
+          portion = int(block.remaining_size * (bw / total_bw)) if bw > 0 else 0
+          proportions.append(portion)
+        if sum(proportions) == 0 and proportions:
+          proportions[0] = block.remaining_size
+        else:
+          diff = block.remaining_size - sum(proportions)
+          if proportions and diff != 0:
+            proportions[0] += diff
+        allocations: List[TransmissionRequest] = []
+        for (path, _, _), portion in zip(ordered, proportions):
+          if portion <= 0:
+            continue
+          allocations.append(TransmissionRequest(block=block, path=path, size=portion))
+        return allocations if allocations else None
+      # 丢掉共用窗口最小的那条路径，重新计算
+      min_t = min(candidates, key=lambda x: x[2])[2]
+      candidates = [c for c in candidates if c[2] > min_t]
+    return None
 
 
 class DAMSConservativeScheduler(DAMSScheduler):

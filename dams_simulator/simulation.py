@@ -270,6 +270,10 @@ def _execute_request(decision: TransmissionRequest, current_time: float) -> Tran
     block.start_tx_time = start_time
   block.finish_time = max(block.finish_time or 0.0, finish_time)
 
+  # 如果预计完成时间已超过截止时间，则标记取消，后续不再调度该块。
+  if block.finish_time > block.deadline:
+    block.dropped = True
+
   path.available_time = finish_time
   path.busy_time += transmit_time
   path.bytes_sent += actual_size
