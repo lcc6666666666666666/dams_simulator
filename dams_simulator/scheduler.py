@@ -228,18 +228,31 @@ class DAMSScheduler(BaseScheduler):
       block: FrameBlock,
       current_time: float,
   ) -> list[tuple[PathState, float, float]]:
-    """尝试移除最慢路径的分配，使最晚完成时间不超过 deadline。"""
-    paths_sorted = sorted(bw_info, key=lambda x: x[0].latency_s, reverse=True)
-    while paths_sorted:
-      total_bw = sum(bw for _, _, bw in paths_sorted)
+    """寻找共同发送窗口 T 使 max_finish<=deadline；不足时再逐步丢掉路径。"""
+    candidates = []
+    for path, start, bw in bw_info:
+      t_max = block.deadline - start - path.latency_s
+      if t_max <= 0 or bw <= 0:
+        continue
+      candidates.append((path, start, bw, t_max))
+    if not candidates:
+      return []
+
+    # 迭代：先尝试用所有路径的最小 t_max 窗口；不足再去掉窗口最小的路径重算。
+    while candidates:
+      t_common = min(t_max for _, _, _, t_max in candidates)
+      total_bw = sum(bw for _, _, bw, _ in candidates)
       if total_bw <= 0:
         return []
-      send_duration = block.remaining_size / total_bw
-      finish_times = [start + p.latency_s + send_duration for (p, start, _) in paths_sorted]
-      if max(finish_times) <= block.deadline:
-        return paths_sorted
-      # 移除一条 RTT 最大的路径重试
-      paths_sorted.pop(0)
+      # 以公共窗口内的总能力判定是否可完成
+      if total_bw * t_common >= block.remaining_size:
+        send_duration = block.remaining_size / total_bw
+        finish_times = [start + p.latency_s + send_duration for (p, start, _, _) in candidates]
+        if max(finish_times) <= block.deadline and send_duration <= t_common + 1e-9:
+          return [(p, s, bw) for (p, s, bw, _) in candidates]
+      # 去掉公共窗口最小的路径（它限制了 T）
+      min_t = min(candidates, key=lambda x: x[3])[3]
+      candidates = [c for c in candidates if c[3] > min_t]
     return []
 
 
