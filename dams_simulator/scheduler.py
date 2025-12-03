@@ -167,35 +167,38 @@ class DAMSScheduler(BaseScheduler):
       remaining_time = block.deadline - current_time
       if remaining_time <= 0:
         continue
-      caps: dict[str, float] = {}
+      bw_info = []
       for path in idle_paths:
         start_time = max(current_time, path.available_time)
-        time_budget = block.deadline - start_time - path.latency_s
-        if time_budget <= 0:
-          caps[path.path_id] = 0.0
+        bw = path.bandwidth_at(start_time)
+        if bw <= 0:
           continue
-        bandwidth = path.bandwidth_at(start_time)
-        caps[path.path_id] = max(0.0, bandwidth * time_budget)
-      total_cap = sum(caps.values())
-      if total_cap <= 0:
+        bw_info.append((path, start_time, bw))
+      if not bw_info:
         continue
-      if block.remaining_size > total_cap:
+      total_bw = sum(bw for _, _, bw in bw_info)
+      if total_bw <= 0:
         continue
 
-      size_needed = block.remaining_size
+      send_duration = block.remaining_size / total_bw
+      finish_times = [
+          start + path.latency_s + send_duration for (path, start, _) in bw_info
+      ]
+      finish_target = max(finish_times)
+      if finish_target > block.deadline:
+        self._cancel_victim(prioritized, block)
+        continue
+
       ordered_paths = sorted(idle_paths, key=lambda p: (p.latency_s, -p.bandwidth_at(current_time)))
       proportions: List[int] = []
       for path in ordered_paths:
-        cap = caps[path.path_id]
-        if cap <= 0:
-          proportions.append(0)
-        else:
-          proportions.append(int(size_needed * (cap / total_cap)))
-
+        bw = path.bandwidth_at(max(current_time, path.available_time))
+        portion = int(block.remaining_size * (bw / total_bw)) if bw > 0 else 0
+        proportions.append(portion)
       if sum(proportions) == 0 and proportions:
-        proportions[0] = size_needed
+        proportions[0] = block.remaining_size
       else:
-        diff = size_needed - sum(proportions)
+        diff = block.remaining_size - sum(proportions)
         if proportions and diff != 0:
           proportions[0] += diff
 
@@ -207,6 +210,18 @@ class DAMSScheduler(BaseScheduler):
       if allocations:
         return allocations
     return []
+
+  @staticmethod
+  def _normalized_profit(block: FrameBlock) -> float:
+    remaining = max(1, block.remaining_size)
+    return block.priority / remaining
+
+  def _cancel_victim(self, ready_blocks: Sequence[FrameBlock], current_block: FrameBlock) -> None:
+    candidates = [b for b in ready_blocks if not b.dropped and b is not current_block]
+    if not candidates:
+      return
+    victim = min(candidates, key=self._normalized_profit)
+    victim.dropped = True
 
 
 class DAMSConservativeScheduler(DAMSScheduler):
