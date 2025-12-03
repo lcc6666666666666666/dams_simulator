@@ -176,29 +176,28 @@ class DAMSScheduler(BaseScheduler):
         bw_info.append((path, start_time, bw))
       if not bw_info:
         continue
+      bw_info = self._rebalance_to_meet_deadline(bw_info, block, current_time)
+      if not bw_info:
+        self._cancel_victim(prioritized, block)
+        continue
+
       total_bw = sum(bw for _, _, bw in bw_info)
       if total_bw <= 0:
         continue
 
-      send_duration = block.remaining_size / total_bw
-      finish_times = [
-          start + path.latency_s + send_duration for (path, start, _) in bw_info
-      ]
-      finish_target = max(finish_times)
-      if finish_target > block.deadline:
-        self._cancel_victim(prioritized, block)
-        continue
-
-      ordered_paths = sorted(idle_paths, key=lambda p: (p.latency_s, -p.bandwidth_at(current_time)))
+      selected_paths = [p for (p, _, _) in bw_info]
+      bw_map = {p.path_id: bw for (p, _, bw) in bw_info}
+      ordered_paths = sorted(selected_paths, key=lambda p: (p.latency_s, -bw_map[p.path_id]))
+      size_needed = block.remaining_size
       proportions: List[int] = []
       for path in ordered_paths:
-        bw = path.bandwidth_at(max(current_time, path.available_time))
-        portion = int(block.remaining_size * (bw / total_bw)) if bw > 0 else 0
+        bw = bw_map.get(path.path_id, 0.0)
+        portion = int(size_needed * (bw / total_bw)) if bw > 0 else 0
         proportions.append(portion)
       if sum(proportions) == 0 and proportions:
-        proportions[0] = block.remaining_size
+        proportions[0] = size_needed
       else:
-        diff = block.remaining_size - sum(proportions)
+        diff = size_needed - sum(proportions)
         if proportions and diff != 0:
           proportions[0] += diff
 
@@ -222,6 +221,26 @@ class DAMSScheduler(BaseScheduler):
       return
     victim = min(candidates, key=self._normalized_profit)
     victim.dropped = True
+
+  def _rebalance_to_meet_deadline(
+      self,
+      bw_info: list[tuple[PathState, float, float]],
+      block: FrameBlock,
+      current_time: float,
+  ) -> list[tuple[PathState, float, float]]:
+    """尝试移除最慢路径的分配，使最晚完成时间不超过 deadline。"""
+    paths_sorted = sorted(bw_info, key=lambda x: x[0].latency_s, reverse=True)
+    while paths_sorted:
+      total_bw = sum(bw for _, _, bw in paths_sorted)
+      if total_bw <= 0:
+        return []
+      send_duration = block.remaining_size / total_bw
+      finish_times = [start + p.latency_s + send_duration for (p, start, _) in paths_sorted]
+      if max(finish_times) <= block.deadline:
+        return paths_sorted
+      # 移除一条 RTT 最大的路径重试
+      paths_sorted.pop(0)
+    return []
 
 
 class DAMSConservativeScheduler(DAMSScheduler):
